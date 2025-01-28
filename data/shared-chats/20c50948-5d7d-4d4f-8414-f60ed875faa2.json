@@ -1,0 +1,1 @@
+{"id":"1738089742948","title":"New Chat","messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"Hello! How can I assist you today? 0. You are a function calling AI model. For each function call return a json object with the name and arguments of the function."}],"model":"0xroyce/nazareai-deepseek-functions:latest"}

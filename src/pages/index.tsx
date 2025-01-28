@@ -14,8 +14,9 @@ type Chat = {
     messages: Message[];
 }
 
-type Model = {
+type ModelConfig = {
     name: string;
+    systemPrompt?: string;
     details: {
         parameter_size: string;
         quantization_level: string;
@@ -23,7 +24,7 @@ type Model = {
 }
 
 export default function VortexTau() {
-    const [models, setModels] = useState<Model[]>([]);
+    const [models, setModels] = useState<ModelConfig[]>([]);
     const [selectedModel, setSelectedModel] = useState<string>('');
     const [chats, setChats] = useState<Chat[]>([]);
     const [currentChat, setCurrentChat] = useState<Chat | null>(null);
@@ -38,10 +39,11 @@ export default function VortexTau() {
     const [shareUrl, setShareUrl] = useState<string | null>(null);
     const [isShareModalOpen, setIsShareModalOpen] = useState(false);
     const chatContainerRef = useRef<HTMLDivElement>(null);
-    const [isThinkingEnabled, setIsThinkingEnabled] = useState(false);
-    const [thinkingSteps, setThinkingSteps] = useState<string[]>([]);
 
     const MAX_INPUT_LENGTH = 5000;
+
+    const queryClassificationCache = new Map<string, {result: boolean, timestamp: number}>();
+    const CACHE_DURATION = 1000 * 60 * 5; // 5 minutes
 
     useEffect(() => {
         console.log('Component mounted. Fetching models and loading chats...');
@@ -86,7 +88,7 @@ export default function VortexTau() {
             
             // Set default model - replace 'llama2' with your preferred default model name
             const defaultModel = '0xroyce/plutus:latest';
-            const modelExists = data.some((model: Model) => model.name === defaultModel);
+            const modelExists = data.some((model: ModelConfig) => model.name === defaultModel);
             
             if (modelExists) {
                 setSelectedModel(defaultModel);
@@ -99,6 +101,22 @@ export default function VortexTau() {
         } finally {
             setIsModelLoading(false);
         }
+    };
+
+    const getSystemPromptForModel = (modelName: string): string => {
+        if (modelName === '0xroyce/nazareai-deepseek-functions' || modelName === '0xroyce/nazareai-deepseek-functions:latest') {
+            return `You are a helpful AI assistant with function calling capabilities. 
+            
+Respond normally to general queries with plain text.
+
+Only use tool calls when the user explicitly requests to use a tool or when a function is clearly needed (e.g., "call a tool to...", "use a function to...", etc.).
+
+When making a tool call, format it as:
+<tool_call>{"name": "function_name", "arguments": {"arg1": "value1"}}</tool_call>`;
+        }
+        
+        // Default system prompt for other models
+        return `You are a helpful AI assistant. Provide clear and concise responses to user queries. Format your responses appropriately using markdown when needed.`;
     };
 
     const loadChatsFromStorage = () => {
@@ -185,7 +203,7 @@ export default function VortexTau() {
     };
 
     const performSearch = async (query: string) => {
-        console.log('Performing search for query:', query);
+        console.log('🔍 Starting search for query:', query);
         try {
             const response = await fetch('/api/search', {
                 method: 'POST',
@@ -194,15 +212,101 @@ export default function VortexTau() {
             });
 
             if (!response.ok) {
+                console.error('🚫 Search failed with status:', response.status);
                 throw new Error('Search failed');
             }
 
             const data = await response.json();
-            console.log('Search results:', data.results);
+            console.log('📊 Search results:', data);
+            if (!data.results || data.results.length === 0) {
+                console.log('⚠️ No search results found');
+            }
             return data.results;
         } catch (error) {
-            console.error('Search error:', error);
+            console.error('❌ Search error:', error);
             return [];
+        }
+    };
+
+    const shouldPerformSearch = async (input: string): Promise<boolean> => {
+        // Check cache first
+        const cached = queryClassificationCache.get(input);
+        if (cached && (Date.now() - cached.timestamp) < CACHE_DURATION) {
+            return cached.result;
+        }
+
+        const classificationPrompt = `Determine if this query requires current/real-time data to be answered accurately and completely. Answer only with YES or NO.
+
+        Examples requiring real-time data (YES):
+        - Questions about prices, rates, or values
+        - Current events or news
+        - Weather conditions
+        - Status or state of something
+        - Latest statistics or numbers
+        - Recent developments
+
+        Examples NOT requiring real-time data (NO):
+        - Historical facts
+        - Definitions
+        - How-to questions
+        - Theoretical concepts
+        - General knowledge
+        - Mathematical calculations
+
+        Query: "${input}"
+        Answer (YES/NO):`;
+
+        try {
+            const response = await fetch('/api/chat', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    model: '0xroyce/Plutus-3B:latest', // Always use Plutus for classification
+                    message: classificationPrompt,
+                    history: [],
+                    systemPrompt: "You are a query classifier. Only respond with YES or NO."
+                })
+            });
+
+            if (!response.ok) {
+                return false;
+            }
+
+            let result = '';
+            const reader = response.body?.getReader();
+            if (!reader) return false;
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                const chunk = new TextDecoder().decode(value);
+                const lines = chunk.split('\n');
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        const data = line.slice(6);
+                        if (data === '[DONE]') break;
+                        try {
+                            const parsed = JSON.parse(data);
+                            if (parsed.content) {
+                                result += parsed.content;
+                            }
+                        } catch (e) {
+                            console.error('Error parsing SSE data:', e);
+                        }
+                    }
+                }
+            }
+
+            // Cache the result
+            queryClassificationCache.set(input, {
+                result: result.trim().toUpperCase() === 'YES',
+                timestamp: Date.now()
+            });
+
+            return result.trim().toUpperCase() === 'YES';
+        } catch (error) {
+            console.error('Error in classification:', error);
+            return false;
         }
     };
 
@@ -210,6 +314,7 @@ export default function VortexTau() {
         if (!input.trim() || !selectedModel) return;
         if (input.length > MAX_INPUT_LENGTH) return;
     
+        console.log('Selected model:', selectedModel);
         let chat = currentChat;
         if (!chat) {
             chat = createNewChat();
@@ -228,106 +333,34 @@ export default function VortexTau() {
         setError(null);
     
         try {
-            // Always search for current information for relevant queries
-            if (input.toLowerCase().includes('president') || 
-                input.toLowerCase().includes('weather') || 
-                input.toLowerCase().includes('news') ||
-                input.toLowerCase().includes('current') ||
-                input.toLowerCase().includes('latest') ||
-                input.toLowerCase().includes('today')) {
-                
-                console.log('Query requires current information, performing search...');
+            const needsCurrentInfo = await shouldPerformSearch(input);
+            console.log('🤔 Needs current info?', needsCurrentInfo);
+            
+            if (needsCurrentInfo) {
+                console.log('🔄 Query requires current information, performing search...');
                 const searchResults = await performSearch(input);
                 
                 if (searchResults && searchResults.length > 0) {
-                    console.log('Search results found:', searchResults);
+                    console.log('✅ Search results found:', searchResults);
                     
-                    // Instead of adding search results to chat history, use them directly in the prompt
                     const searchContext = searchResults.map((result: any) => 
                         `Source: ${result.title}\n${result.snippet}\n`
                     ).join('\n');
 
-                    // Create the final prompt that forces the model to use the search results
-                    const finalPrompt = `Here is some current information about the topic:\n\n${searchContext}\n\nBased ONLY on the information provided above (not your existing knowledge), provide a clear and concise answer to this question: ${input}. Format the response as a direct answer without mentioning the sources or that you're using provided information.`;
+                    console.log('📝 Search context:', searchContext);
+
+                    const finalPrompt = `Here is current information about the topic:\n\n${searchContext}\n\nProvide a clear, direct answer to: "${input}". Focus on current facts and data from the sources. Do not mention sources or add disclaimers.`;
                     
                     await sendMessageToChat(finalPrompt, updatedChat);
                     return;
+                } else {
+                    console.log('⚠️ No search results found, falling back to normal processing');
                 }
             }
 
-            // If no search results or not a current events query, proceed with normal processing
-            if (!isThinkingEnabled) {
-                if (/^(hi|hello|hey)\.?$/i.test(input)) {
-                    await sendMessageToChat("User has greeted you with " + input, updatedChat);
-                } else {
-                    await sendMessageToChat(input, updatedChat);
-                }
-            } else {
-                const classifyPrompt = `Given the user's input: "${input}", classify it into one of the following intents: 
-                [greeting, farewell, question, task, complex_task, riddle, coded_message, other]. Only provide the intent as a single word from the list.
-                Do not include any extra text.`;
-                const intentResponse = await runPrompt(classifyPrompt);
-                const intent = intentResponse.trim().toLowerCase();
-                console.log("************************\n\n"+intent+"\n\n************************")
-    
-                if (/^(greeting|farewell|other)\.?$/i.test(intent)) {
-                    const response = await runPrompt("User said " + input + " which is a greeting so just greet him without anything else.");
-                    await sendMessageToChat(response, updatedChat);
-                } else if (/^(question|task|complex_task)\.?$/i.test(intent)) {
-                    const questionsPrompt = `Given the task: "${input}", consider the following:
-                - if generating additional questions would help provide a better response, generate up to 5 relevant questions that would aid in completing this task. Each question should be concise and directly related to the task.
-                - if generating next best action would lead into better response and generate up to 5 next best actions. Each action should be concise and directly related to the task.
-                - always provide a clear and concise response. 
-                - If additional questions or generating next best actions are not necessary, proceed to provide a direct and appropriate response to the user's input.`;
-                    const questionsResponse = await runPrompt(questionsPrompt);
-                    const questions = questionsResponse.split('\n').filter(q => q.trim() !== '').slice(0, 5);
-    
-                    if (questions.length === 0) {
-                        await sendMessageToChat(questionsResponse, updatedChat);
-                    } else {
-                        let thinkingProcess = '';
-                        let answers: string[] = [];
-    
-                        for (const question of questions) {
-                            thinkingProcess += `Assistant: Thinking: ${question}\n`;
-                            thinkingProcess += `Assistant: Processing: ...\n\n`;
-                            setStreamingContent(thinkingProcess);
-                            await new Promise(resolve => setTimeout(resolve, 1000));
-    
-                            const answer = await runPrompt(question);
-                            answers.push(answer);
-                        }
-    
-                        const synthesisPrompt = `Based on the following questions and answers, provide a comprehensive response to the original task: "${input}"\n\nQ&A:\n${questions.map((q, i) => `Q: ${q}\nA: ${answers[i]}`).join('\n\n')}`;
-                        await sendMessageToChat(synthesisPrompt, updatedChat);
-                    }
-                } else if (/^coded_message|riddle\.?$/i.test(intent)) {
-                    const codedMessagePrompt = `Analyze the following potential coded message:
-        
-                    "${input}"
-                    
-                    Follow these steps in your analysis:
-                    1. List all items with their quantities.
-                    2. Extract the numbers from the message.
-                    3. Consider if these numbers could represent letters (A=1, B=2, C=3, etc., up to Z=26).
-                    4. If a number-to-letter pattern seems possible:
-                    a. Map each number to its corresponding letter.
-                    b. Combine these letters to see if they form a word or phrase.
-                    5. Look for other patterns or codes (e.g., first letter of each word, alternating items, etc.).
-                    6. If multiple interpretations are possible, list them in order of likelihood.
-                    7. Provide your final decoded message or messages, if any are found.
-                    8. Explain your reasoning throughout the process.
-                    
-                    Present your analysis in a clear, step-by-step format.`;
-                    
-                    const response = await runPrompt(codedMessagePrompt);
-                    await sendMessageToChat(response, updatedChat);
-                            
-                } else {
-                    const response = await runPrompt(input);
-                    await sendMessageToChat(response, updatedChat);
-                }
-            }
+            // If no search needed or no results found, proceed with normal processing
+            console.log('➡️ Proceeding with normal processing');
+            await sendMessageToChat(input, updatedChat);
         } catch (error) {
             console.error('Error in chat process:', error);
             setError('Failed to process the message. Please try again.');
@@ -343,7 +376,8 @@ export default function VortexTau() {
             body: JSON.stringify({
                 model: selectedModel,
                 message: prompt,
-                history: []
+                history: [],
+                systemPrompt: getSystemPromptForModel(selectedModel)
             })
         });
 
@@ -389,7 +423,8 @@ export default function VortexTau() {
             body: JSON.stringify({
                 model: selectedModel,
                 message: message,
-                history: chat.messages  // Include full chat history with search results
+                history: chat.messages,
+                systemPrompt: getSystemPromptForModel(selectedModel)
             })
         });
 
@@ -546,43 +581,6 @@ export default function VortexTau() {
         }
     };
 
-    const ThinkingToggle = () => {
-        const [showTooltip, setShowTooltip] = useState(false);
-
-        return (
-            <div className="flex items-center mb-2 relative">
-                <span className="mr-2 text-sm">Thinking (beta):</span>
-                <button
-                    onClick={() => setIsThinkingEnabled(!isThinkingEnabled)}
-                    className={`w-12 h-6 flex items-center rounded-full p-1 ${
-                        isThinkingEnabled ? 'bg-black' : 'bg-gray-300'
-                    }`}
-                >
-                    <div
-                        className={`bg-white w-4 h-4 rounded-full shadow-md transform duration-300 ease-in-out ${
-                            isThinkingEnabled ? 'translate-x-6' : 'translate-x-0'
-                        }`}
-                    ></div>
-                </button>
-                <div
-                    className="ml-2 cursor-pointer"
-                    onMouseEnter={() => setShowTooltip(true)}
-                    onMouseLeave={() => setShowTooltip(false)}
-                >
-                    <InfoIcon size={16} />
-                </div>
-                {showTooltip && (
-                    <div className="absolute left-0 top-full mt-2 p-2 bg-[#baff2a] border border-black shadow-lg rounded z-10 max-w-xs">
-                        <p className="text-xs">
-                            Thinking is a beta feature that allows the AI to think/reason.
-                            Please note that when enabled, responses may take longer to generate.
-                        </p>
-                    </div>
-                )}
-            </div>
-        );
-    };
-
     useEffect(() => {
         const shareId = new URLSearchParams(window.location.search).get('share');
         if (shareId) {
@@ -634,7 +632,11 @@ export default function VortexTau() {
                 <div className={`w-64 border-r border-black relative ${isSidebarOpen ? 'block' : 'hidden'} md:block`}>
                     <div className="overflow-y-auto absolute inset-0 bottom-8">
                         <div className="p-2">
-                            <ThinkingToggle />
+                            <div className="border border-black bg-[#fff9e6] p-3 mb-3">
+                                <p className="text-xs mb-2">
+                                VortexTau is a platform that connects you with NazareAI's advanced models.<br />Through its integrated search and real-time information access, it delivers the knowledge you need.
+                                </p>
+                            </div>
                             <button
                                 onClick={createNewChat}
                                 className="w-full bg-white hover:bg-gray-100 text-black font-bold py-1 px-2 border border-black text-sm mb-2"

@@ -37,6 +37,20 @@ function loadChatData() {
     return {}
 }
 
+// Add Message type at the top since it's used in ChatRequest
+type Message = {
+    role: 'user' | 'assistant' | 'system';
+    content: string;
+}
+
+// Update the request type to include systemPrompt
+type ChatRequest = {
+    model: string;
+    message: string;
+    history: Message[];
+    systemPrompt?: string;
+};
+
 export default async function handler(
     req: NextApiRequest,
     res: NextApiResponse
@@ -44,8 +58,9 @@ export default async function handler(
     log(`Received ${req.method} request to /api/chat`)
 
     if (req.method === 'POST') {
-        const { model, message, history } = req.body
+        const { model, message, history, systemPrompt } = req.body
         log(`Chat request for model: ${model}, message length: ${message.length}, history length: ${history.length}`)
+        log(`Full model name being used: ${model}`)
 
         res.writeHead(200, {
             'Content-Type': 'text/event-stream',
@@ -55,9 +70,22 @@ export default async function handler(
 
         try {
             log('Initiating Ollama chat stream')
+            const systemPromptToUse = systemPrompt || `You are a helpful AI assistant. Provide clear and concise responses to user queries.`
+            
+            // Create messages array with system prompt as first message
+            const messages = [
+                { role: 'system', content: systemPromptToUse },
+                ...history,
+                { role: 'user', content: message }
+            ]
+
+            log(`Using system prompt: ${systemPromptToUse}`)
+            log(`Final messages being sent to Ollama:`)
+            log(JSON.stringify(messages, null, 2))
+            
             const stream = await ollama.chat({
                 model,
-                messages: [...history, { role: 'user', content: message }],
+                messages,
                 stream: true,
             })
 
@@ -65,7 +93,7 @@ export default async function handler(
 
             for await (const chunk of stream) {
                 if (chunk.message) {
-                    //log(`Sending chunk: ${JSON.stringify(chunk.message)}`)
+                    log(`Chunk from Ollama: ${JSON.stringify(chunk.message)}`)
                     res.write(`data: ${JSON.stringify(chunk.message)}\n\n`)
                     fullResponse += chunk.message.content
                 }
